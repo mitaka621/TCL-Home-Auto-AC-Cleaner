@@ -33,6 +33,7 @@ builder.Services.AddHttpClient<TclAcService>(client =>
 builder.Services.AddScoped<TclAcService>();
 builder.Services.AddSingleton(serviceProvider =>
     new GlobalExceptionHandler(serviceProvider, useDatabase));
+builder.Services.AddHostedService<ScheduledCleaningService>();
 
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole().SetMinimumLevel(LogLevel.Warning);
@@ -55,6 +56,7 @@ if (useDatabase)
     }
 }
 
+// Run initial cleaning immediately
 var service = host.Services.GetRequiredService<TclAcService>();
 
 try
@@ -81,3 +83,9 @@ catch (Exception ex)
 {
     await exceptionHandler.HandleExceptionAsync(ex, "Main");
 }
+
+// Start the background service and keep the application running
+Console.WriteLine("\nBackground service is running. Scheduled cleaning will execute every Sunday at 10:00 AM.");
+Console.WriteLine("Press Ctrl+C to stop the application.\n");
+
+await host.RunAsync();
