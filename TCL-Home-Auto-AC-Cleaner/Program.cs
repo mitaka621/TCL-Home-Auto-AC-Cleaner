@@ -73,6 +73,10 @@ try
         var deviceIdsToClean = devices.Where(d => d.Value.IsOnline == OnlineStatusEnum.Online).Select(d => d.Key).ToList();
         Console.WriteLine($"Sending clean commands to {deviceIdsToClean.Count} online device(s)...\n");
         await service.CleanAcsAsync(deviceIdsToClean);
+
+        //sometimes the ac fails to start cleaning so we send it a second time
+        await Task.Delay(1000);
+        await service.CleanAcsAsync(deviceIdsToClean);
     }
     else
     {
