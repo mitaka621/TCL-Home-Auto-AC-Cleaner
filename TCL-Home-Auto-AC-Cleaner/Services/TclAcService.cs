@@ -24,23 +24,28 @@ public class TclAcService : IDisposable
     private const string _baseAccountUrl = "https://pa.account.tcl.com";
     private const string _baseApiUrl = "https://prod-eu.aws.tcljd.com";
 
+    private string? region;
+
     private readonly HttpClient _httpClient;
     private readonly IConfiguration _configuration;
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<TclAcService>? _logger;
     private readonly bool _useDatabase;
+    private readonly GlobalExceptionHandler _globalExceptionHandler;
     private AuthTokens? _authTokens;
 
     public TclAcService(
         HttpClient httpClient,
         IConfiguration configuration,
         IServiceProvider serviceProvider,
+        GlobalExceptionHandler globalExceptionHandler,
         ILogger<TclAcService>? logger = null)
     {
         _httpClient = httpClient;
         _configuration = configuration;
         _serviceProvider = serviceProvider;
         _logger = logger;
+        _globalExceptionHandler = globalExceptionHandler;
         _httpClient.DefaultRequestHeaders.Add("user-agent", "Android");
         _useDatabase = _configuration.GetValue<bool>("UseDatabase", false);
     }
@@ -143,30 +148,18 @@ public class TclAcService : IDisposable
 
     public async Task CleanAcsAsync(List<string> deviceIds, string? version = null)
     {
-        if (_authTokens == null)
-        {
-            await AuthenticateAsync();
-        }
-
-        if (_authTokens == null || string.IsNullOrEmpty(_authTokens.CognitoToken))
-        {
-            throw new InvalidOperationException("Not authenticated or missing Cognito token. Call AuthenticateAsync first.");
-        }
-
-        var mqttEndpoint = _authTokens.MqttEndpoint ?? "data.iot.eu-central-1.amazonaws.com";
-        var region = ExtractRegionFromEndpoint(mqttEndpoint);
+        await EnsureAuthenticatedAsync();
 
         foreach (var deviceId in deviceIds)
         {
-            await SendCleanCommandAsync(deviceId, region, _authTokens.CognitoToken, version);
+            await SendCleanCommandAsync(deviceId, region!, _authTokens!.CognitoToken!, version);
         }
     }
 
     public async Task<AcDeviceState> GetAcStateAsync(string deviceId)
     {
         await EnsureAuthenticatedAsync();
-        var region = GetRegion();
-        var shadowJson = await GetDeviceShadowAsync(deviceId, region);
+        var shadowJson = await GetDeviceShadowAsync(deviceId, region!);
         var state = AcDeviceState.FromShadow(deviceId, shadowJson);
 
         _logger?.LogInformation("Read AC state for {DeviceId}: {State}", deviceId, state);
@@ -203,7 +196,6 @@ public class TclAcService : IDisposable
         TimeSpan maxWait,
         CancellationToken cancellationToken)
     {
-        var region = GetRegion();
         var deviceId = device.Key;
 
         Console.WriteLine($"\n=== <{deviceId}> Starting cleaning workflow for {device.Value.NickName}({device.Value.LocationName ?? "Unknown"})  ===");
@@ -212,10 +204,10 @@ public class TclAcService : IDisposable
         var savedState = await GetAcStateAsync(deviceId);
         Console.WriteLine($"Saved pre-clean state: {savedState}");
 
-        await SendCleanCommandAsync(deviceId, region, _authTokens!.CognitoToken!, null);
+        await SendCleanCommandAsync(deviceId, region!, _authTokens!.CognitoToken!, null);
 
         Console.WriteLine($"Waiting for cleaning to finish on {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}) (polling every {pollInterval.TotalMinutes:F0} min, max {maxWait.TotalHours:F0} h)...");
-        var cleaningFinished = await WaitForCleaningCompleteAsync(device, region, pollInterval, maxWait, cancellationToken);
+        var cleaningFinished = await WaitForCleaningCompleteAsync(device, region!, pollInterval, maxWait, cancellationToken);
 
         if (!cleaningFinished)
         {
@@ -353,21 +345,26 @@ public class TclAcService : IDisposable
 
     private async Task EnsureAuthenticatedAsync()
     {
-        if (_authTokens == null)
+        try
+        {
+            if (_authTokens == null)
+            {
+                await AuthenticateAsync();
+            }
+
+            if (_authTokens == null || string.IsNullOrEmpty(_authTokens.CognitoToken))
+            {
+                throw new InvalidOperationException("Not authenticated or missing Cognito token. Call AuthenticateAsync first.");
+            }
+
+            region = ExtractRegionFromEndpoint(_authTokens.MqttEndpoint ?? "data.iot.eu-central-1.amazonaws.com");
+
+            await GetAwsCredentialsAsync(_authTokens!.CognitoToken!, region);
+        }
+        catch (NotAuthorizedException)
         {
             await AuthenticateAsync();
         }
-
-        if (_authTokens == null || string.IsNullOrEmpty(_authTokens.CognitoToken))
-        {
-            throw new InvalidOperationException("Not authenticated or missing Cognito token. Call AuthenticateAsync first.");
-        }
-    }
-
-    private string GetRegion()
-    {
-        var mqttEndpoint = _authTokens?.MqttEndpoint ?? "data.iot.eu-central-1.amazonaws.com";
-        return ExtractRegionFromEndpoint(mqttEndpoint);
     }
 
     private async Task<UserLoginResponse> DoAccountAuthAsync(string username, string password)
@@ -436,8 +433,6 @@ public class TclAcService : IDisposable
     {
         try
         {
-            await EnsureAuthenticatedAsync();
-
             await PublishShadowUpdateAsync(deviceId, region, new Dictionary<string, object?>
             {
                 ["selfClean"] = 1,
@@ -455,9 +450,8 @@ public class TclAcService : IDisposable
         {
             if (_useDatabase)
             {
-                await LogExceptionToDatabaseAsync("SendCleanCommand", ex.ToString());
+                await _globalExceptionHandler.HandleExceptionAsync(ex, "SendCleanCommand");
             }
-            throw;
         }
     }
 
@@ -600,8 +594,7 @@ public class TclAcService : IDisposable
         }
         catch (Exception ex)
         {
-            await LogExceptionToDatabaseAsync("SaveDevicesToDatabase", ex.ToString());
-            throw;
+            await _globalExceptionHandler.HandleExceptionAsync(ex, "SaveDevicesToDatabase");
         }
     }
 
@@ -622,30 +615,7 @@ public class TclAcService : IDisposable
         }
         catch (Exception ex)
         {
-            await LogExceptionToDatabaseAsync("SaveCleaningToDatabase", ex.ToString());
-            throw;
-        }
-    }
-
-    private async Task LogExceptionToDatabaseAsync(string name, string? value)
-    {
-        try
-        {
-            using var scope = _serviceProvider.CreateScope();
-            var dbContext = scope.ServiceProvider.GetRequiredService<TclHomeDbContext>();
-
-            var exceptionLog = new ExceptionLog
-            {
-                Name = name,
-                Value = value,
-                TimeOccurred = DateTime.Now
-            };
-            dbContext.Exceptions.Add(exceptionLog);
-            await dbContext.SaveChangesAsync();
-        }
-        catch
-        {
-            // If we can't log to database, silently fail to avoid infinite loops
+            await _globalExceptionHandler.HandleExceptionAsync(ex, "SaveCleaningToDatabase");
         }
     }
 

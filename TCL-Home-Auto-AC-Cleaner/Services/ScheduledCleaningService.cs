@@ -118,7 +118,6 @@ public class ScheduledCleaningService : BackgroundService
         catch (Exception ex)
         {
             await exceptionHandler.HandleExceptionAsync(ex, "ScheduledCleaning");
-            throw;
         }
     }
 }
