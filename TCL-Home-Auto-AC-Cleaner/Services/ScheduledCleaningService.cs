@@ -11,6 +11,7 @@ public class ScheduledCleaningService : BackgroundService
     private readonly ILogger<ScheduledCleaningService>? _logger;
     private readonly TimeSpan _scheduledTime = new TimeSpan(10, 0, 0); // 10:00 AM
     private readonly DayOfWeek _scheduledDay = DayOfWeek.Sunday;
+    private bool _initialRun = false;
 
     public ScheduledCleaningService(IServiceProvider serviceProvider, ILogger<ScheduledCleaningService>? logger = null)
     {
@@ -29,7 +30,7 @@ public class ScheduledCleaningService : BackgroundService
                 var nextRunTime = GetNextScheduledTime();
                 var delay = nextRunTime - DateTime.Now;
 
-                if (delay.TotalMilliseconds > 0)
+                if (_initialRun && delay.TotalMilliseconds > 0)
                 {
                     _logger?.LogInformation($"Next scheduled cleaning: {nextRunTime:yyyy-MM-dd HH:mm:ss}. Waiting {delay.TotalDays:F2} days.");
                     await Task.Delay(delay, stoppingToken);
@@ -38,8 +39,10 @@ public class ScheduledCleaningService : BackgroundService
                 if (stoppingToken.IsCancellationRequested)
                     break;
 
-                _logger?.LogInformation("Executing scheduled cleaning...");
+                _logger?.LogInformation($"Executing {(_initialRun! ? "first run" : "scheduled")} cleaning...");
                 await ExecuteCleaningAsync(stoppingToken);
+
+                _initialRun = true;
             }
             catch (OperationCanceledException)
             {
@@ -99,14 +102,13 @@ public class ScheduledCleaningService : BackgroundService
 
             if (devices.Any(x => x.Value.IsOnline == OnlineStatusEnum.Online))
             {
-                var deviceIdsToClean = devices
+                var devicesToClean = devices
                     .Where(d => d.Value.IsOnline == OnlineStatusEnum.Online)
-                    .Select(d => d.Key)
-                    .ToList();
+                    .ToDictionary(k => k.Key, v => v.Value);
 
-                _logger?.LogInformation($"Sending clean commands to {deviceIdsToClean.Count} online device(s)...");
-                await service.CleanAcsAsync(deviceIdsToClean);
-                _logger?.LogInformation("Scheduled cleaning completed successfully.");
+                _logger?.LogInformation($"Sending clean commands with state restore to {devicesToClean.Count} online device(s)...");
+                await service.CleanAcsWithStateRestoreAsync(devicesToClean, cancellationToken);
+                _logger?.LogInformation("Scheduled cleaning workflow completed.");
             }
             else
             {

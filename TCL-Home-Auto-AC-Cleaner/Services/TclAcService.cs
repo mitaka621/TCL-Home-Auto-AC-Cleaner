@@ -1,7 +1,3 @@
-using System.IdentityModel.Tokens.Jwt;
-using System.Security.Cryptography;
-using System.Text;
-using System.Text.Json;
 using Amazon.CognitoIdentity;
 using Amazon.CognitoIdentity.Model;
 using Amazon.IotData;
@@ -9,6 +5,11 @@ using Amazon.IotData.Model;
 using Amazon.Runtime;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using TCL_Home_Auto_AC_Cleaner.Data;
 using TCL_Home_Auto_AC_Cleaner.Data.Entities;
 using TCL_Home_Auto_AC_Cleaner.Models.Auth;
@@ -26,14 +27,20 @@ public class TclAcService : IDisposable
     private readonly HttpClient _httpClient;
     private readonly IConfiguration _configuration;
     private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<TclAcService>? _logger;
     private readonly bool _useDatabase;
     private AuthTokens? _authTokens;
 
-    public TclAcService(HttpClient httpClient, IConfiguration configuration, IServiceProvider serviceProvider)
+    public TclAcService(
+        HttpClient httpClient,
+        IConfiguration configuration,
+        IServiceProvider serviceProvider,
+        ILogger<TclAcService>? logger = null)
     {
         _httpClient = httpClient;
         _configuration = configuration;
         _serviceProvider = serviceProvider;
+        _logger = logger;
         _httpClient.DefaultRequestHeaders.Add("user-agent", "Android");
         _useDatabase = _configuration.GetValue<bool>("UseDatabase", false);
     }
@@ -155,6 +162,214 @@ public class TclAcService : IDisposable
         }
     }
 
+    public async Task<AcDeviceState> GetAcStateAsync(string deviceId)
+    {
+        await EnsureAuthenticatedAsync();
+        var region = GetRegion();
+        var shadowJson = await GetDeviceShadowAsync(deviceId, region);
+        var state = AcDeviceState.FromShadow(deviceId, shadowJson);
+
+        _logger?.LogInformation("Read AC state for {DeviceId}: {State}", deviceId, state);
+        Console.WriteLine($"AC state for {deviceId}: {state}");
+
+        return state;
+    }
+
+    public async Task CleanAcsWithStateRestoreAsync(
+        Dictionary<string, DeviceInfo> deviceIds,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureAuthenticatedAsync();
+
+        var pollInterval = TimeSpan.FromMinutes(_configuration.GetValue("CleaningPollIntervalMinutes", 15));
+        var maxWait = TimeSpan.FromHours(_configuration.GetValue("CleaningMaxWaitHours", 3));
+
+        List<Task> cleaningTasks = new List<Task>();
+
+        foreach (var device in deviceIds)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            cleaningTasks.Add(CleanSingleAcWithStateRestoreAsync(device, pollInterval, maxWait, cancellationToken));
+        }
+
+        await Task.WhenAll(cleaningTasks);
+
+        Console.WriteLine($"========================================Cleaned all ACs.========================================");
+    }
+
+    private async Task CleanSingleAcWithStateRestoreAsync(
+        KeyValuePair<string, DeviceInfo> device,
+        TimeSpan pollInterval,
+        TimeSpan maxWait,
+        CancellationToken cancellationToken)
+    {
+        var region = GetRegion();
+        var deviceId = device.Key;
+
+        Console.WriteLine($"\n=== <{deviceId}> Starting cleaning workflow for {device.Value.NickName}({device.Value.LocationName ?? "Unknown"})  ===");
+        _logger?.LogInformation("Starting cleaning workflow for {DeviceId}", deviceId);
+
+        var savedState = await GetAcStateAsync(deviceId);
+        Console.WriteLine($"Saved pre-clean state: {savedState}");
+
+        await SendCleanCommandAsync(deviceId, region, _authTokens!.CognitoToken!, null);
+
+        Console.WriteLine($"Waiting for cleaning to finish on {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}) (polling every {pollInterval.TotalMinutes:F0} min, max {maxWait.TotalHours:F0} h)...");
+        var cleaningFinished = await WaitForCleaningCompleteAsync(device, region, pollInterval, maxWait, cancellationToken);
+
+        if (!cleaningFinished)
+        {
+            var message = $"<{deviceId}> Cleaning did not finish within {maxWait.TotalHours:F0} hours for device {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}). Skipping state restore.";
+            Console.WriteLine(message);
+            _logger?.LogWarning(message);
+            return;
+        }
+
+        Console.WriteLine($"<{deviceId}> Cleaning finished on {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}).");
+
+        if (!savedState.WasPoweredOn)
+        {
+            Console.WriteLine($"<{deviceId}> Device {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}) was off before cleaning. No state restore needed.");
+            _logger?.LogInformation("Device {DeviceId} was off before cleaning. No restore needed.", deviceId);
+            return;
+        }
+
+        var restoreState = savedState.BuildRestoreDesiredState();
+        Console.WriteLine($"<{deviceId}> Restoring previous AC state on {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}): {JsonSerializer.Serialize(restoreState)}");
+        _logger?.LogInformation("Restoring AC state for {DeviceId}: {State}", deviceId, JsonSerializer.Serialize(restoreState));
+
+        await PublishShadowUpdateAsync(deviceId, region, restoreState);
+        Console.WriteLine($"<{deviceId}> Restore command sent to {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}).");
+        _logger?.LogInformation("Restore command sent to {DeviceId}", deviceId);
+    }
+
+    private async Task<bool> WaitForCleaningCompleteAsync(
+        KeyValuePair<string, DeviceInfo> device,
+        string region,
+        TimeSpan pollInterval,
+        TimeSpan maxWait,
+        CancellationToken cancellationToken)
+    {
+        var startedAt = DateTimeOffset.UtcNow;
+        var deadline = startedAt + maxWait;
+        var cleaningObserved = false;
+
+        Console.WriteLine($"Waiting 2 minutes before the first cleaning status check for {device.Value.NickName}({device.Value.LocationName ?? "Unknown"})...");
+        await Task.Delay(TimeSpan.FromMinutes(2), cancellationToken);
+
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var currentState = await GetAcStateAsync(device.Key);
+
+            if (currentState.IsCleaningActive)
+            {
+                cleaningObserved = true;
+                Console.WriteLine($"<{device.Key}> Device {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}) is cleaning (selfClean={currentState.SelfClean}).");
+            }
+            else if (cleaningObserved)
+            {
+                Console.WriteLine($"<{device.Key}> Device {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}) reports cleaning complete (selfClean={currentState.SelfClean?.ToString() ?? "null"}).");
+                return true;
+            }
+            else
+            {
+                var elapsed = DateTimeOffset.UtcNow - startedAt;
+                Console.WriteLine(
+                    $"<{device.Key}> Device {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}) has not reported selfClean=1 yet (selfClean={currentState.SelfClean?.ToString() ?? "null"}, elapsed {elapsed.TotalMinutes:F0} min).");
+            }
+
+            var remaining = deadline - DateTimeOffset.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+            {
+                break;
+            }
+
+            var delay = remaining < pollInterval ? remaining : pollInterval;
+            Console.WriteLine($"<{device.Key}> Next status check for {device.Value.NickName}({device.Value.LocationName ?? "Unknown"}) in {delay.TotalMinutes:F0} minutes...");
+            await Task.Delay(delay, cancellationToken);
+        }
+
+        return false;
+    }
+
+    private async Task<string> GetDeviceShadowAsync(string deviceId, string region)
+    {
+        var credentials = await GetAwsCredentialsAsync(_authTokens!.CognitoToken!, region);
+        using var iotDataClient = CreateIotDataClient(credentials, region);
+
+        var response = await iotDataClient.GetThingShadowAsync(new GetThingShadowRequest
+        {
+            ThingName = deviceId
+        });
+
+        using var reader = new StreamReader(response.Payload);
+        return await reader.ReadToEndAsync();
+    }
+
+    private async Task PublishShadowUpdateAsync(string deviceId, string region, Dictionary<string, object?> desiredState)
+    {
+        var filteredDesired = desiredState
+            .Where(kvp => kvp.Value != null)
+            .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+        var payload = JsonSerializer.Serialize(new
+        {
+            state = new
+            {
+                desired = filteredDesired
+            },
+            clientToken = $"mobile_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
+        });
+
+        var credentials = await GetAwsCredentialsAsync(_authTokens!.CognitoToken!, region);
+        using var iotDataClient = CreateIotDataClient(credentials, region);
+
+        await iotDataClient.PublishAsync(new PublishRequest
+        {
+            Topic = $"$aws/things/{deviceId}/shadow/update",
+            Payload = new MemoryStream(Encoding.UTF8.GetBytes(payload)),
+            Qos = 1
+        });
+    }
+
+    private AmazonIotDataClient CreateIotDataClient(CognitoCredentials credentials, string region)
+    {
+        var sessionCredentials = new SessionAWSCredentials(
+            credentials.AccessKeyId,
+            credentials.SecretAccessKey,
+            credentials.SessionToken
+        );
+
+        var clientConfig = new AmazonIotDataConfig
+        {
+            ServiceURL = $"https://data.iot.{region}.amazonaws.com"
+        };
+        clientConfig.HttpClientFactory = new BypassSslHttpClientFactory();
+
+        return new AmazonIotDataClient(sessionCredentials, clientConfig);
+    }
+
+    private async Task EnsureAuthenticatedAsync()
+    {
+        if (_authTokens == null)
+        {
+            await AuthenticateAsync();
+        }
+
+        if (_authTokens == null || string.IsNullOrEmpty(_authTokens.CognitoToken))
+        {
+            throw new InvalidOperationException("Not authenticated or missing Cognito token. Call AuthenticateAsync first.");
+        }
+    }
+
+    private string GetRegion()
+    {
+        var mqttEndpoint = _authTokens?.MqttEndpoint ?? "data.iot.eu-central-1.amazonaws.com";
+        return ExtractRegionFromEndpoint(mqttEndpoint);
+    }
+
     private async Task<UserLoginResponse> DoAccountAuthAsync(string username, string password)
     {
         var passwordHash = CalculateMd5Hash(password);
@@ -221,47 +436,14 @@ public class TclAcService : IDisposable
     {
         try
         {
-            var credentials = await GetAwsCredentialsAsync(cognitoToken, region);
+            await EnsureAuthenticatedAsync();
 
-            var cleanCommand = new
+            await PublishShadowUpdateAsync(deviceId, region, new Dictionary<string, object?>
             {
-                state = new
-                {
-                    desired = new
-                    {
-                        selfClean = 1,
-                        powerSwitch = 0
-                    }
-                },
-                clientToken = $"mobile_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
-            };
+                ["selfClean"] = 1,
+                ["powerSwitch"] = 0
+            });
 
-            var payload = JsonSerializer.Serialize(cleanCommand);
-            var payloadBytes = Encoding.UTF8.GetBytes(payload);
-
-            var sessionCredentials = new SessionAWSCredentials(
-                credentials.AccessKeyId,
-                credentials.SecretAccessKey,
-                credentials.SessionToken
-            );
-
-            var clientConfig = new AmazonIotDataConfig
-            {
-                ServiceURL = $"https://data.iot.{region}.amazonaws.com"
-            };
-            clientConfig.HttpClientFactory = new BypassSslHttpClientFactory();
-
-            var iotDataClient = new AmazonIotDataClient(sessionCredentials, clientConfig);
-
-            var topic = $"$aws/things/{deviceId}/shadow/update";
-            var publishRequest = new PublishRequest
-            {
-                Topic = topic,
-                Payload = new MemoryStream(payloadBytes),
-                Qos = 1
-            };
-
-            var response = await iotDataClient.PublishAsync(publishRequest);
             Console.WriteLine($"Clean command sent to device {deviceId}");
 
             if (_useDatabase)

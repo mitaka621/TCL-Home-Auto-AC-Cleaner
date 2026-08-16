@@ -4,7 +4,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using TCL_Home_Auto_AC_Cleaner.Data;
-using TCL_Home_Auto_AC_Cleaner.Enums;
 using TCL_Home_Auto_AC_Cleaner.Services;
 
 var builder = Host.CreateApplicationBuilder(args);
@@ -54,34 +53,6 @@ if (useDatabase)
         await exceptionHandler.HandleExceptionAsync(ex, "DatabaseInitialization");
         return;
     }
-}
-
-// Run initial cleaning immediately
-var service = host.Services.GetRequiredService<TclAcService>();
-
-try
-{
-    await service.AuthenticateAsync();
-    var devices = await service.GetDevicesAsync();
-
-    Console.WriteLine($"Found {devices.Count} device(s):\n");
-    Console.WriteLine(string.Join($"{Environment.NewLine}================================={Environment.NewLine}", devices.Values));
-    Console.WriteLine();
-
-    if (devices.Any(x => x.Value.IsOnline == OnlineStatusEnum.Online))
-    {
-        var deviceIdsToClean = devices.Where(d => d.Value.IsOnline == OnlineStatusEnum.Online).Select(d => d.Key).ToList();
-        Console.WriteLine($"Sending clean commands to {deviceIdsToClean.Count} online device(s)...\n");
-        await service.CleanAcsAsync(deviceIdsToClean);
-    }
-    else
-    {
-        Console.WriteLine("No online devices found.");
-    }
-}
-catch (Exception ex)
-{
-    await exceptionHandler.HandleExceptionAsync(ex, "Main");
 }
 
 // Start the background service and keep the application running
